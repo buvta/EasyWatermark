@@ -20,13 +20,15 @@ import android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.result.ActivityResultCallback
 import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
 import androidx.core.view.forEach
 import androidx.fragment.app.commit
 import androidx.lifecycle.Lifecycle
@@ -52,7 +54,6 @@ import me.rosuh.easywatermark.ui.panel.*
 import me.rosuh.easywatermark.ui.widget.CenterLayoutManager
 import me.rosuh.easywatermark.ui.widget.LaunchView
 import me.rosuh.easywatermark.utils.FileUtils
-import me.rosuh.easywatermark.utils.PickImageContract
 import me.rosuh.easywatermark.utils.VibrateHelper
 import me.rosuh.easywatermark.utils.ktx.*
 import me.rosuh.easywatermark.utils.onItemClick
@@ -61,13 +62,21 @@ import me.rosuh.easywatermark.utils.onItemClick
 @AndroidEntryPoint
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var pickIconLauncher: ActivityResultLauncher<String>
+    private lateinit var pickIconPhotoPickerLauncher: ActivityResultLauncher<PickVisualMediaRequest>
+    private lateinit var pickMultiplePhotoPickerLauncher: ActivityResultLauncher<PickVisualMediaRequest>
+    private lateinit var pickIconLegacyLauncher: ActivityResultLauncher<String>
     private val viewModel: MainViewModel by viewModels()
 
     private val currentBgColor: Int
         get() = ((launchView.parent as? View?)?.background as? ColorDrawable)?.color ?: colorSurface
 
     private lateinit var requestPermissionLauncher: ActivityResultLauncher<String>
+
+    private var pendingPermissionAction: (() -> Unit)? = null
+
+    private val isSystemPhotoPickerAvailable by lazy {
+        ActivityResultContracts.PickVisualMedia.isPhotoPickerAvailable(this)
+    }
 
     private val contentFunList: List<FuncTitleModel> by lazy {
         listOf(
@@ -227,12 +236,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun registerResultCallback() {
-        pickIconLauncher =
-            registerForActivityResult(PickImageContract()) { uri: Uri? ->
-                handleActivityResult(REQ_PICK_ICON, listOf(uri))
+        pickMultiplePhotoPickerLauncher =
+            registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris ->
+                handlePickedMedia(REQ_CODE_PICK_IMAGE, uris)
+            }
+        pickIconPhotoPickerLauncher =
+            registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+                val result = uri?.let(::listOf) ?: emptyList()
+                handlePickedMedia(REQ_PICK_ICON, result)
+            }
+        pickIconLegacyLauncher =
+            registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+                val result = uri?.let(::listOf) ?: emptyList()
+                handlePickedMedia(REQ_PICK_ICON, result)
             }
         requestPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
             if (isGranted) {
+                pendingPermissionAction?.invoke()
+                pendingPermissionAction = null
                 return@registerForActivityResult
             }
             Toast.makeText(
@@ -240,6 +261,7 @@ class MainActivity : AppCompatActivity() {
                 getString(R.string.request_permission_failed),
                 Toast.LENGTH_SHORT
             ).show()
+            pendingPermissionAction = null
         }
     }
 
@@ -441,9 +463,7 @@ class MainActivity : AppCompatActivity() {
         }
         // pick image button
         launchView.ivSelectedPhotoTips.setOnClickListener {
-            checkReadingPermission(requestPermissionLauncher) {
-                performFileSearch(REQ_CODE_PICK_IMAGE)
-            }
+            performFileSearch(REQ_CODE_PICK_IMAGE)
         }
         // setting bg
         launchView.ivPhoto.apply {
@@ -595,9 +615,7 @@ class MainActivity : AppCompatActivity() {
                 TextContentDisplayFragment.replaceShow(this, launchView.fcFunctionDetail.id)
             }
             FuncTitleModel.FuncType.Icon -> {
-                checkReadingPermission(requestPermissionLauncher) {
-                    performFileSearch(REQ_PICK_ICON)
-                }
+                performFileSearch(REQ_PICK_ICON)
             }
             FuncTitleModel.FuncType.Color -> {
                 ColorFragment.replaceShow(this, launchView.fcFunctionDetail.id)
@@ -664,9 +682,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         R.id.action_pick -> {
-            checkReadingPermission(requestPermissionLauncher) {
-                performFileSearch(REQ_CODE_PICK_IMAGE)
-            }
+            performFileSearch(REQ_CODE_PICK_IMAGE)
             true
         }
 
@@ -683,32 +699,43 @@ class MainActivity : AppCompatActivity() {
      * Fires an intent to spin up the "file chooser" UI and select an image.
      */
     private fun performFileSearch(requestCode: Int) {
-        if (requestCode == REQ_PICK_ICON) {
-            val mime = "image/*"
-            val result = kotlin.runCatching {
-                when (requestCode) {
-                    REQ_PICK_ICON -> {
-                        pickIconLauncher.launch(mime)
-                    }
-                }
-            }
+        val request = PickVisualMediaRequest.Builder()
+            .setMediaType(ActivityResultContracts.PickVisualMedia.ImageOnly)
+            .build()
 
-            if (result.isFailure) {
-                Toast.makeText(
-                    this,
-                    getString(R.string.tips_not_app_can_open_images),
-                    Toast.LENGTH_LONG
-                ).show()
-                Log.i("performFileSearch", result.exceptionOrNull()?.message ?: "No msg provided")
+        if (isSystemPhotoPickerAvailable) {
+            launchView.logoView.stop()
+            when (requestCode) {
+                REQ_PICK_ICON -> pickIconPhotoPickerLauncher.launch(request)
+                else -> pickMultiplePhotoPickerLauncher.launch(request)
             }
-        } else {
-            GalleryFragment().apply {
+            return
+        }
+
+        val launchLegacyPicker = {
+            if (requestCode == REQ_PICK_ICON) {
                 launchView.logoView.stop()
-                doOnDismiss {
-                    launchView.logoView.start()
-                }
-                show(supportFragmentManager, "GalleryFragment")
+                pickIconLegacyLauncher.launch("image/*")
+            } else {
+                openLegacyGallery()
             }
+        }
+
+        pendingPermissionAction = launchLegacyPicker
+        checkReadingPermission(requestPermissionLauncher, grant = {
+            val action = pendingPermissionAction
+            pendingPermissionAction = null
+            action?.invoke()
+        })
+    }
+
+    private fun openLegacyGallery() {
+        GalleryFragment().apply {
+            launchView.logoView.stop()
+            doOnDismiss {
+                launchView.logoView.start()
+            }
+            show(supportFragmentManager, "GalleryFragment")
         }
     }
 
@@ -724,10 +751,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun handleActivityResult(requestCode: Int, list: List<Uri?>?) {
-        val finalList = list?.filterNotNull()?.filter {
+    private fun handlePickedMedia(requestCode: Int, list: List<Uri>) {
+        launchView.logoView.start()
+        val finalList = list.filter {
             FileUtils.isImage(this.contentResolver, it)
-        } ?: emptyList()
+        }
         if (finalList.isEmpty()) {
             Toast.makeText(
                 this,
@@ -823,7 +851,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun requestPermission(block: () -> Unit) {
-        checkWritingPermission(requestPermissionLauncher, grant = block)
+        pendingPermissionAction = block
+        checkWritingPermission(requestPermissionLauncher, grant = {
+            val action = pendingPermissionAction
+            pendingPermissionAction = null
+            action?.invoke()
+        })
     }
 
     companion object {
